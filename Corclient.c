@@ -5,25 +5,39 @@
 #include <arpa/inet.h>      // inet_addr, htons
 #include <unistd.h>
 #include <poll.h>
-#include <errno.h>
 
 #define MSG_LEN 1024
+
+static ssize_t send_all(int fd, const void *buf, size_t len)
+{
+    size_t sent = 0;
+    const char *p = buf;
+    while (sent < len) {
+        ssize_t n = send(fd, p + sent, len - sent, 0);
+        if (n < 0) return -1;
+        sent += (size_t)n;
+    }
+    return (ssize_t)sent;
+}
 
 int main(int argc , char *argv[])
 {
     int sock;
-    int n;
+    ssize_t n;
     struct sockaddr_in adresse;
-    char send_buff[MSG_LEN];
-    char recv_buff[MSG_LEN];
+    char buff[MSG_LEN];
+    char line[MSG_LEN];
 
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <server_ip_address> <server_port>\n", argv[0]);
+    if (argc != 5) {
+        fprintf(stderr, "Usage: %s <server_ip> <server_port> <ROLE> <pseudo>\n", argv[0]);
+        fprintf(stderr, "ROLE = OWNER | TENANT\n");
         return 1;
     }
 
     const char *server_ip = argv[1];
     int port = atoi(argv[2]);
+    const char *role = argv[3];
+    const char *pseudo = argv[4];
     if (port <= 0 || port > 65535) {
         fprintf(stderr, "Port invalide: %s\n", argv[2]);
         return 1;
@@ -32,10 +46,10 @@ int main(int argc , char *argv[])
     sock = socket(AF_INET , SOCK_STREAM , 0);
     if (sock == -1)
     {
-        perror("Could not create socket");
+        perror("Peut pas créer de socket");
         return 1;
     }
-    puts("Socket created");
+    puts("Socket créée");
 
     memset(&adresse, 0, sizeof(adresse));
 
@@ -52,11 +66,38 @@ int main(int argc , char *argv[])
 
     if (connect(sock , (struct sockaddr *)&adresse , sizeof(adresse)) < 0)
     {
-        perror("connect failed. Error");
+        perror("Échec de la connexion");
         close(sock);
         return 1;
     }
-    puts("Connected\n");
+    puts("Connecté\n");
+
+    if (strcmp(role, "OWNER") != 0 && strcmp(role, "TENANT") != 0) {
+        fprintf(stderr, "ROLE must be OWNER or TENANT\n");
+        close(sock);
+        return 1;
+    }
+
+    // Send initial identification
+    char hello[MSG_LEN];
+    snprintf(hello, sizeof(hello), "%s %s", role, pseudo);
+    if (send_all(sock, hello, strlen(hello)) < 0) {
+        perror("send hello failed");
+        close(sock);
+        return 1;
+    }
+
+    printf("=== Menu %s ===\n", role);
+    if (strcmp(role, "OWNER") == 0) {
+        printf("1 <code> : SET CODE <code> (6 chiffres)\n");
+        printf("2 <sec>  : SET VALIDITY <sec>\n");
+        printf("3        : SHOW (code + durée restante)\n");
+        printf("4        : QUIT\n");
+    } else {
+        printf("1 <code> : tenter un code (6 chiffres)\n");
+        printf("2        : QUIT\n");
+    }
+    printf("-------------------------------\n");
 
     struct pollfd pfds[2];
     pfds[0].fd = STDIN_FILENO;
@@ -64,64 +105,76 @@ int main(int argc , char *argv[])
     pfds[1].fd = sock;
     pfds[1].events = POLLIN;
 
-    int running = 1;
-    while (running) {
-        int ready = poll(pfds, 2, -1);
-        if (ready < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("poll failed");
+    while (1) {
+        int ret = poll(pfds, 2, -1);
+        if (ret < 0) {
+            perror("poll");
             break;
         }
 
+        // stdin ready
         if (pfds[0].revents & POLLIN) {
-            printf("Entrez un message ('/quit' pour quitter) : ");
-            fflush(stdout);
+            if (!fgets(line, sizeof(line), stdin)) {
+                fprintf(stderr, "stdin closed\n");
+                break;
+            }
+            size_t len = strlen(line);
+            while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) {
+                line[len-1] = '\0';
+                len--;
+            }
+            if (len == 0) continue;
 
-            if (fgets(send_buff, MSG_LEN, stdin) == NULL) {
-                printf("\nFin de l'entrée standard.\n");
-                running = 0;
-            } else {
-                size_t len = strlen(send_buff);
-                if (len > 0 && send_buff[len - 1] == '\n') {
-                    send_buff[len - 1] = '\0';
-                    len--;
+            if (strcmp(role, "OWNER") == 0) {
+                if (strncmp(line, "1 ", 2) == 0) {
+                    snprintf(buff, sizeof(buff), "SET CODE %s", line + 2);
+                } else if (strncmp(line, "2 ", 2) == 0) {
+                    snprintf(buff, sizeof(buff), "SET VALIDITY %s", line + 2);
+                } else if (strcmp(line, "3") == 0) {
+                    snprintf(buff, sizeof(buff), "SHOW");
+                } else if (strcmp(line, "4") == 0) {
+                    snprintf(buff, sizeof(buff), "QUIT");
+                } else {
+                    printf("Commande inconnue. Utiliser 1/2/3/4.\n");
+                    continue;
                 }
+            } else { // TENANT
+                if (strncmp(line, "1 ", 2) == 0) {
+                    snprintf(buff, sizeof(buff), "%s", line + 2);
+                } else if (strcmp(line, "2") == 0) {
+                    snprintf(buff, sizeof(buff), "QUIT");
+                } else {
+                    printf("Commande inconnue. Utiliser 1/2.\n");
+                    continue;
+                }
+            }
 
-                if (strcmp(send_buff, "/quit") == 0) {
-                    printf("Fermeture de la connexion.\n");
-                    running = 0;
-                } else if (len > 0) {
-                    if (send(sock, send_buff, len, 0) < 0) {
-                        perror("send failed");
-                        running = 0;
-                    }
-                }
+            if (send_all(sock, buff, strlen(buff)) < 0) {
+                perror("send failed");
+                break;
+            }
+
+            if (strcmp(buff, "QUIT") == 0) {
+                printf("Fermeture de la connexion.\n");
+                break;
             }
         }
 
+        // socket ready
         if (pfds[1].revents & POLLIN) {
-            n = recv(sock, recv_buff, MSG_LEN - 1, 0);
+            n = recv(sock, buff, MSG_LEN - 1, 0);
             if (n < 0) {
                 perror("recv failed");
                 break;
             } else if (n == 0) {
-                printf("Serveur a fermé la connexion.\n");
+                printf("Serveur fermé la connexion.\n");
                 break;
             }
-
-            recv_buff[n] = '\0';
-            printf("\nRéponse du serveur : \"%s\"\n", recv_buff);
-        }
-
-        if (pfds[1].revents & (POLLHUP | POLLERR | POLLNVAL)) {
-            printf("Connexion serveur interrompue.\n");
-            break;
+            buff[n] = '\0';
+            printf("Réponse du serveur : \"%s\"\n", buff);
         }
     }
 
     close(sock);
-
     return 0;
 }

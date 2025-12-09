@@ -7,15 +7,98 @@
 #include<arpa/inet.h>
 #include<unistd.h>
 #include<poll.h>
+#include<sys/random.h>
+#include<time.h>
 
 #define MSG_LEN 1024
 #define BACKLOG 16
 
+typedef enum {
+	ROLE_UNKNOWN = 0,
+	ROLE_OWNER,
+	ROLE_TENANT
+} client_role_t;
+
 typedef struct client_node {
 	int fd;
 	struct sockaddr_in addr;
+	client_role_t role;
+	char pseudo[64];
+	int attempts;
 	struct client_node *next;
 } client_node_t;
+
+typedef struct {
+	char code[7]; // 6 digits + '\0'
+	int validity_secs;
+	time_t expires_at;
+	int owner_fd; // -1 if none
+	char owner_pseudo[64];
+	int has_code;
+} lock_state_t;
+
+static lock_state_t g_lock = {
+	.code = "000000",
+	.validity_secs = 3600,
+	.expires_at = 0,
+	.owner_fd = -1,
+	.owner_pseudo = {0},
+	.has_code = 0
+};
+
+static const char *HISTORY_PATH = "history.log";
+
+static const char *ALLOWED_OWNERS[] = {"owner", "Arona", NULL};
+static const char *ALLOWED_TENANTS[] = {"tenant", "Corentin", NULL};
+
+static int secure_random_digit(void)
+{
+	unsigned int val = 0;
+	if (getrandom(&val, sizeof(val), 0) != sizeof(val)) {
+		val = (unsigned int)rand();
+	}
+	return (int)(val % 10);
+}
+
+static void generate_code(char out[7])
+{
+	for (int i = 0; i < 6; ++i) {
+		out[i] = (char)('0' + secure_random_digit());
+	}
+	out[6] = '\0';
+}
+
+static void log_history(const char *pseudo, const char *result)
+{
+	FILE *f = fopen(HISTORY_PATH, "a");
+	if (!f) {
+		perror("fopen history.log");
+		return;
+	}
+	time_t now = time(NULL);
+	fprintf(f, "%ld;%s;%s\n", (long)now, pseudo ? pseudo : "unknown", result);
+	fclose(f);
+}
+
+static void notify_owner(const char *msg)
+{
+	if (g_lock.owner_fd >= 0) {
+		ssize_t sent = send(g_lock.owner_fd, msg, strlen(msg), 0);
+		if (sent < 0) {
+			perror("notify_owner send");
+		}
+	}
+}
+
+static void rotate_code_and_notify(const char *reason)
+{
+	generate_code(g_lock.code);
+	g_lock.expires_at = time(NULL) + g_lock.validity_secs;
+	char buffer[128];
+	snprintf(buffer, sizeof(buffer), "ALERT %s NEWCODE %s VALIDITY %d\n",
+	         reason ? reason : "update", g_lock.code, g_lock.validity_secs);
+	notify_owner(buffer);
+}
 
 static void add_client(client_node_t **head, int fd, const struct sockaddr_in *addr)
 {
@@ -28,6 +111,9 @@ static void add_client(client_node_t **head, int fd, const struct sockaddr_in *a
 	}
 	node->fd = fd;
 	node->addr = *addr;
+	node->role = ROLE_UNKNOWN;
+	node->pseudo[0] = '\0';
+	node->attempts = 0;
 	node->next = *head;
 	*head = node;
 }
@@ -46,6 +132,10 @@ static void remove_client(client_node_t **head, client_node_t *target)
 		{
 			client_node_t *tmp = *cursor;
 			*cursor = tmp->next;
+			if (tmp->fd == g_lock.owner_fd)
+			{
+				g_lock.owner_fd = -1;
+			}
 			close(tmp->fd);
 			free(tmp);
 			return;
@@ -73,6 +163,45 @@ static void log_client_endpoint(const client_node_t *node, const char *prefix)
 	fflush(stdout);
 }
 
+static void trim_newline(char *s)
+{
+	if (!s) return;
+	size_t len = strlen(s);
+	while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r'))
+	{
+		s[len - 1] = '\0';
+		--len;
+	}
+}
+
+static int is_six_digits(const char *s)
+{
+	if (!s) return 0;
+	if (strlen(s) != 6) return 0;
+	for (size_t i = 0; i < 6; ++i) {
+		if (s[i] < '0' || s[i] > '9') return 0;
+	}
+	return 1;
+}
+
+static int remaining_validity_seconds(void)
+{
+	time_t now = time(NULL);
+	if (g_lock.expires_at <= now) return 0;
+	return (int)(g_lock.expires_at - now);
+}
+
+static int pseudo_allowed(client_role_t role, const char *pseudo)
+{
+	const char *const *list = (role == ROLE_OWNER) ? ALLOWED_OWNERS : ALLOWED_TENANTS;
+	if (!pseudo || !list) return 0;
+	for (size_t i = 0; list[i]; ++i)
+	{
+		if (strcmp(list[i], pseudo) == 0) return 1;
+	}
+	return 0;
+}
+
 int main(int argc , char *argv[])
 {
 
@@ -81,6 +210,8 @@ int main(int argc , char *argv[])
 	char *endptr = NULL;
 	long port;
 	client_node_t *clients = NULL;
+
+	srand((unsigned int)time(NULL));
 
 	if (argc != 2)
 	{
@@ -176,6 +307,12 @@ int main(int argc , char *argv[])
 			break;
 		}
 
+		// Rotate code if expired
+		if (g_lock.has_code && g_lock.expires_at > 0 && time(NULL) >= g_lock.expires_at)
+		{
+			rotate_code_and_notify("code expired");
+		}
+
 		//New connection
 		if (pfds[0].revents & POLLIN)
 		{
@@ -211,17 +348,173 @@ int main(int argc , char *argv[])
 				if (bytes > 0)
 				{
 					client_message[bytes] = '\0';
-					printf("Received from client [%s:%u]: %s\n",
+					trim_newline(client_message);
+					printf("Received from client fd=%d [%s:%u]: %s \n",
+					       node->fd,
 					       inet_ntoa(node->addr.sin_addr),
 					       ntohs(node->addr.sin_port),
 					       client_message);
 					fflush(stdout);
 
-					ssize_t sent = send(node->fd, client_message, (size_t)bytes, 0);
-					if (sent < 0)
+					// Initial role assignment
+					if (node->role == ROLE_UNKNOWN)
 					{
-						perror("send failed");
-						remove_client(&clients, node);
+						if (strncmp(client_message, "OWNER ", 6) == 0)
+						{
+							node->role = ROLE_OWNER;
+							strncpy(node->pseudo, client_message + 6, sizeof(node->pseudo) - 1);
+							node->pseudo[sizeof(node->pseudo) - 1] = '\0';
+							if (!pseudo_allowed(node->role, node->pseudo))
+							{
+								const char *err = "ERR unauthorized pseudo\n";
+								send(node->fd, err, strlen(err), 0);
+								remove_client(&clients, node);
+								continue;
+							}
+							g_lock.owner_fd = node->fd;
+							strncpy(g_lock.owner_pseudo, node->pseudo, sizeof(g_lock.owner_pseudo) - 1);
+							if (!g_lock.has_code)
+							{
+								generate_code(g_lock.code);
+								g_lock.expires_at = time(NULL) + g_lock.validity_secs;
+								g_lock.has_code = 1;
+							}
+							char welcome[128];
+							snprintf(welcome, sizeof(welcome), "WELCOME %s CODE %s VALIDITY %d\n",
+							         node->pseudo, g_lock.code, remaining_validity_seconds());
+							send(node->fd, welcome, strlen(welcome), 0);
+						}
+						else if (strncmp(client_message, "TENANT ", 7) == 0)
+						{
+							node->role = ROLE_TENANT;
+							strncpy(node->pseudo, client_message + 7, sizeof(node->pseudo) - 1);
+							node->pseudo[sizeof(node->pseudo) - 1] = '\0';
+							if (!pseudo_allowed(node->role, node->pseudo))
+							{
+								const char *err = "ERR unauthorized pseudo\n";
+								send(node->fd, err, strlen(err), 0);
+								remove_client(&clients, node);
+								continue;
+							}
+							node->attempts = 0;
+							const char *msg = "ENTER CODE\n";
+							send(node->fd, msg, strlen(msg), 0);
+						}
+						else
+						{
+							const char *err = "ERR specify OWNER <pseudo> or TENANT <pseudo>\n";
+							send(node->fd, err, strlen(err), 0);
+						}
+						continue;
+					}
+
+					if (node->role == ROLE_OWNER)
+					{
+						if (strncmp(client_message, "SET CODE ", 9) == 0)
+						{
+							const char *newcode = client_message + 9;
+							if (!is_six_digits(newcode))
+							{
+								const char *err = "ERR code must be 6 digits\n";
+								send(node->fd, err, strlen(err), 0);
+								continue;
+							}
+							strncpy(g_lock.code, newcode, sizeof(g_lock.code));
+							g_lock.expires_at = time(NULL) + g_lock.validity_secs;
+							g_lock.has_code = 1;
+							char resp[128];
+							snprintf(resp, sizeof(resp), "OK CODE %s VALIDITY %d\n",
+							         g_lock.code, g_lock.validity_secs);
+							send(node->fd, resp, strlen(resp), 0);
+						}
+						else if (strncmp(client_message, "SET VALIDITY ", 13) == 0)
+						{
+							const char *val = client_message + 13;
+							int seconds = atoi(val);
+							if (seconds <= 0)
+							{
+								const char *err = "ERR validity must be > 0\n";
+								send(node->fd, err, strlen(err), 0);
+								continue;
+							}
+							g_lock.validity_secs = seconds;
+							g_lock.expires_at = time(NULL) + g_lock.validity_secs;
+							char resp[128];
+							snprintf(resp, sizeof(resp), "OK CODE %s VALIDITY %d\n",
+							         g_lock.code, g_lock.validity_secs);
+							send(node->fd, resp, strlen(resp), 0);
+						}
+						else if (strcmp(client_message, "SHOW") == 0)
+						{
+							char resp[128];
+							snprintf(resp, sizeof(resp), "OK CODE %s VALIDITY %d\n",
+							         g_lock.code, remaining_validity_seconds());
+							send(node->fd, resp, strlen(resp), 0);
+						}
+						else if (strcmp(client_message, "QUIT") == 0)
+						{
+							const char *bye = "BYE\n";
+							send(node->fd, bye, strlen(bye), 0);
+							remove_client(&clients, node);
+						}
+						else
+						{
+							const char *err = "ERR unknown command\n";
+							send(node->fd, err, strlen(err), 0);
+						}
+					}
+					else if (node->role == ROLE_TENANT)
+					{
+						// code attempt
+						if (!g_lock.has_code)
+						{
+							const char *err = "ERR no code available\n";
+							send(node->fd, err, strlen(err), 0);
+							continue;
+						}
+						time_t now = time(NULL);
+						if (g_lock.has_code && g_lock.expires_at > 0 && now >= g_lock.expires_at)
+						{
+							rotate_code_and_notify("code expired");
+							const char *msg = "ERR CODE EXPIRED\n";
+							send(node->fd, msg, strlen(msg), 0);
+							log_history(node->pseudo, "code expired");
+							continue;
+						}
+
+						if (!is_six_digits(client_message))
+						{
+							const char *err = "ERR code must be 6 digits\n";
+							send(node->fd, err, strlen(err), 0);
+							continue;
+						}
+
+						if (strcmp(client_message, g_lock.code) == 0)
+						{
+							const char *ok = "ACCESS GRANTED\n";
+							send(node->fd, ok, strlen(ok), 0);
+							log_history(node->pseudo, "success");
+							node->attempts = 0;
+						}
+						else
+						{
+							node->attempts += 1;
+							if (node->attempts >= 3)
+							{
+								log_history(node->pseudo, "alarm triggered");
+								rotate_code_and_notify("alarm");
+								const char *alarm = "ALARM TRIGGERED\n";
+								send(node->fd, alarm, strlen(alarm), 0);
+								node->attempts = 0;
+							}
+							else
+							{
+								char err[64];
+								snprintf(err, sizeof(err), "INVALID CODE (%d/3)\n", node->attempts);
+								send(node->fd, err, strlen(err), 0);
+								log_history(node->pseudo, "failed attempt");
+							}
+						}
 					}
 				}
 				else if (bytes == 0)
