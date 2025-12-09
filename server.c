@@ -202,6 +202,22 @@ static int pseudo_allowed(client_role_t role, const char *pseudo)
 	return 0;
 }
 
+static void ensure_code_fresh(void)
+{
+	if (!g_lock.has_code)
+	{
+		generate_code(g_lock.code);
+		g_lock.expires_at = time(NULL) + g_lock.validity_secs;
+		g_lock.has_code = 1;
+		return;
+	}
+
+	if (g_lock.expires_at > 0 && time(NULL) >= g_lock.expires_at)
+	{
+		rotate_code_and_notify("code expired");
+	}
+}
+
 int main(int argc , char *argv[])
 {
 
@@ -397,7 +413,10 @@ int main(int argc , char *argv[])
 								continue;
 							}
 							node->attempts = 0;
-							const char *msg = "ENTER CODE\n";
+							ensure_code_fresh();
+							char msg[160];
+							snprintf(msg, sizeof(msg), "CURRENT CODE %s VALIDITY %d\nENTER CODE\n",
+							         g_lock.code, remaining_validity_seconds());
 							send(node->fd, msg, strlen(msg), 0);
 						}
 						else
