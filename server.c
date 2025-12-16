@@ -9,6 +9,7 @@
 #include<poll.h>
 #include<sys/random.h>
 #include<time.h>
+#include<sqlite3.h>
 
 #define MSG_LEN 1024
 #define BACKLOG 16
@@ -46,7 +47,8 @@ static lock_state_t g_lock = {
 	.has_code = 0
 };
 
-static const char *HISTORY_PATH = "history.log";
+static const char *DB_PATH = "history.db";
+static sqlite3 *g_db = NULL;
 
 static const char *ALLOWED_OWNERS[] = {"owner", "Arona", NULL};
 static const char *ALLOWED_TENANTS[] = {"tenant", "Corentin", NULL};
@@ -127,6 +129,42 @@ static int secure_random_digit(void)
 	return (int)(val % 10);
 }
 
+static int db_init(void)
+{
+	if (sqlite3_open(DB_PATH, &g_db) != SQLITE_OK)
+	{
+		fprintf(stderr, "sqlite3_open failed: %s\n", sqlite3_errmsg(g_db));
+		return -1;
+	}
+
+	const char *sql =
+		"CREATE TABLE IF NOT EXISTS history ("
+		"id INTEGER PRIMARY KEY AUTOINCREMENT,"
+		"ts INTEGER NOT NULL,"
+		"pseudo TEXT NOT NULL,"
+		"result TEXT NOT NULL"
+		");";
+
+	char *errmsg = NULL;
+	int rc = sqlite3_exec(g_db, sql, NULL, NULL, &errmsg);
+	if (rc != SQLITE_OK)
+	{
+		fprintf(stderr, "sqlite3_exec(create table) failed: %s\n", errmsg ? errmsg : "unknown");
+		sqlite3_free(errmsg);
+		return -1;
+	}
+	return 0;
+}
+
+static void db_close(void)
+{
+	if (g_db)
+	{
+		sqlite3_close(g_db);
+		g_db = NULL;
+	}
+}
+
 static void generate_code(char out[7])
 {
 	for (int i = 0; i < 6; ++i) {
@@ -137,14 +175,37 @@ static void generate_code(char out[7])
 
 static void log_history(const char *pseudo, const char *result)
 {
-	FILE *f = fopen(HISTORY_PATH, "a");
-	if (!f) {
-		perror("fopen history.log");
+	time_t now = time(NULL);
+	if (!g_db)
+	{
+		// base non initialisée : on ne bloque pas l'exécution, on log juste sur stderr
+		fprintf(stderr, "log_history: database not initialized\n");
 		return;
 	}
-	time_t now = time(NULL);
-	fprintf(f, "%ld;%s;%s\n", (long)now, pseudo ? pseudo : "unknown", result);
-	fclose(f);
+
+	const char *sql = "INSERT INTO history(ts, pseudo, result) VALUES(?, ?, ?);";
+	sqlite3_stmt *stmt = NULL;
+
+	if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK)
+	{
+		fprintf(stderr, "sqlite3_prepare_v2 failed: %s\n", sqlite3_errmsg(g_db));
+		return;
+	}
+
+	const char *p = pseudo ? pseudo : "unknown";
+	const char *r = result ? result : "";
+
+	sqlite3_bind_int64(stmt, 1, (sqlite3_int64)now);
+	sqlite3_bind_text(stmt, 2, p, -1, SQLITE_TRANSIENT);
+	sqlite3_bind_text(stmt, 3, r, -1, SQLITE_TRANSIENT);
+
+	int rc = sqlite3_step(stmt);
+	if (rc != SQLITE_DONE)
+	{
+		fprintf(stderr, "sqlite3_step(insert) failed: %s\n", sqlite3_errmsg(g_db));
+	}
+
+	sqlite3_finalize(stmt);
 }
 
 static void notify_owner(const char *msg)
@@ -629,9 +690,15 @@ int main(int argc , char *argv[])
 		return 1;
 	}
 
+	if (db_init() != 0)
+	{
+		return 1;
+	}
+
 	int socket_desc = create_listen_socket(port);
 	if (socket_desc < 0)
 	{
+		db_close();
 		return 1;
 	}
 
@@ -646,6 +713,7 @@ int main(int argc , char *argv[])
 	}
 
 	close(socket_desc);
+	db_close();
 	
 	return 0;
 }
