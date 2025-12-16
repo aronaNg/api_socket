@@ -8,6 +8,13 @@
 
 #define MSG_LEN 1024
 
+typedef struct {
+    const char *server_ip;
+    int port;
+    const char *role;
+    const char *pseudo;
+} client_cfg_t;
+
 static ssize_t send_all(int fd, const void *buf, size_t len)
 {
     size_t sent = 0;
@@ -20,73 +27,74 @@ static ssize_t send_all(int fd, const void *buf, size_t len)
     return (ssize_t)sent;
 }
 
-int main(int argc , char *argv[])
+static int parse_args(int argc, char **argv, client_cfg_t *out)
 {
-    int sock;
-    ssize_t n;
-    struct sockaddr_in adresse;
-    char buff[MSG_LEN];
-    char line[MSG_LEN];
-
     if (argc != 5) {
         fprintf(stderr, "Usage: %s <server_ip> <server_port> <ROLE> <pseudo>\n", argv[0]);
         fprintf(stderr, "ROLE = OWNER | TENANT\n");
-        return 1;
+        return -1;
     }
 
-    const char *server_ip = argv[1];
     int port = atoi(argv[2]);
-    const char *role = argv[3];
-    const char *pseudo = argv[4];
     if (port <= 0 || port > 65535) {
         fprintf(stderr, "Port invalide: %s\n", argv[2]);
-        return 1;
+        return -1;
     }
 
-    sock = socket(AF_INET , SOCK_STREAM , 0);
-    if (sock == -1)
-    {
+    if (strcmp(argv[3], "OWNER") != 0 && strcmp(argv[3], "TENANT") != 0) {
+        fprintf(stderr, "ROLE must be OWNER or TENANT\n");
+        return -1;
+    }
+
+    out->server_ip = argv[1];
+    out->port = port;
+    out->role = argv[3];
+    out->pseudo = argv[4];
+    return 0;
+}
+
+static int connect_server(const client_cfg_t *cfg)
+{
+    int sock = socket(AF_INET , SOCK_STREAM , 0);
+    if (sock == -1) {
         perror("Peut pas créer de socket");
-        return 1;
+        return -1;
     }
     puts("Socket créée");
 
+    struct sockaddr_in adresse;
     memset(&adresse, 0, sizeof(adresse));
-
     adresse.sin_family = AF_INET;
-    adresse.sin_port = htons(port);
-
-    // conversion de l'adresse IP fournie en argument
-    adresse.sin_addr.s_addr = inet_addr(server_ip);
+    adresse.sin_port = htons((uint16_t)cfg->port);
+    adresse.sin_addr.s_addr = inet_addr(cfg->server_ip);
     if (adresse.sin_addr.s_addr == INADDR_NONE) {
-        fprintf(stderr, "Adresse IP invalide: %s\n", server_ip);
+        fprintf(stderr, "Adresse IP invalide: %s\n", cfg->server_ip);
         close(sock);
-        return 1;
+        return -1;
     }
 
-    if (connect(sock , (struct sockaddr *)&adresse , sizeof(adresse)) < 0)
-    {
+    if (connect(sock , (struct sockaddr *)&adresse , sizeof(adresse)) < 0) {
         perror("Échec de la connexion");
         close(sock);
-        return 1;
+        return -1;
     }
     puts("Connecté\n");
+    return sock;
+}
 
-    if (strcmp(role, "OWNER") != 0 && strcmp(role, "TENANT") != 0) {
-        fprintf(stderr, "ROLE must be OWNER or TENANT\n");
-        close(sock);
-        return 1;
-    }
-
-    // Send initial identification
+static int send_hello(int sock, const client_cfg_t *cfg)
+{
     char hello[MSG_LEN];
-    snprintf(hello, sizeof(hello), "%s %s", role, pseudo);
+    snprintf(hello, sizeof(hello), "%s %s", cfg->role, cfg->pseudo);
     if (send_all(sock, hello, strlen(hello)) < 0) {
         perror("send hello failed");
-        close(sock);
-        return 1;
+        return -1;
     }
+    return 0;
+}
 
+static void print_menu(const char *role)
+{
     printf("=== Menu %s ===\n", role);
     if (strcmp(role, "OWNER") == 0) {
         printf("1 <code> : SET CODE <code> (6 chiffres)\n");
@@ -98,7 +106,84 @@ int main(int argc , char *argv[])
         printf("2        : QUIT\n");
     }
     printf("-------------------------------\n");
+}
 
+static int build_command(const char *role, const char *line, char buff[MSG_LEN])
+{
+    if (strcmp(role, "OWNER") == 0) {
+        if (strncmp(line, "1 ", 2) == 0) {
+            snprintf(buff, MSG_LEN, "SET CODE %s", line + 2);
+        } else if (strncmp(line, "2 ", 2) == 0) {
+            snprintf(buff, MSG_LEN, "SET VALIDITY %s", line + 2);
+        } else if (strcmp(line, "3") == 0) {
+            snprintf(buff, MSG_LEN, "SHOW");
+        } else if (strcmp(line, "4") == 0) {
+            snprintf(buff, MSG_LEN, "QUIT");
+        } else {
+            printf("Commande inconnue. Utiliser 1/2/3/4.\n");
+            return -1;
+        }
+    } else { // TENANT
+        if (strncmp(line, "1 ", 2) == 0) {
+            snprintf(buff, MSG_LEN, "%s", line + 2);
+        } else if (strcmp(line, "2") == 0) {
+            snprintf(buff, MSG_LEN, "QUIT");
+        } else {
+            printf("Commande inconnue. Utiliser 1/2.\n");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int handle_stdin(const client_cfg_t *cfg, int sock)
+{
+    char line[MSG_LEN];
+    char buff[MSG_LEN];
+
+    if (!fgets(line, sizeof(line), stdin)) {
+        fprintf(stderr, "stdin closed\n");
+        return -1;
+    }
+    size_t len = strlen(line);
+    while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) {
+        line[len-1] = '\0';
+        len--;
+    }
+    if (len == 0) return 0;
+
+    if (build_command(cfg->role, line, buff) < 0) return 0;
+
+    if (send_all(sock, buff, strlen(buff)) < 0) {
+        perror("send failed");
+        return -1;
+    }
+
+    if (strcmp(buff, "QUIT") == 0) {
+        printf("Fermeture de la connexion.\n");
+        return 1; // signal to stop loop
+    }
+    return 0;
+}
+
+static int handle_socket(int sock)
+{
+    char buff[MSG_LEN];
+    ssize_t n = recv(sock, buff, MSG_LEN - 1, 0);
+    if (n < 0) {
+        perror("recv failed");
+        return -1;
+    } else if (n == 0) {
+        printf("Serveur fermé la connexion.\n");
+        return 1; // stop
+    }
+    buff[n] = '\0';
+    printf("Réponse du serveur : \"%s\"\n", buff);
+    return 0;
+}
+
+static int run_client(const client_cfg_t *cfg, int sock)
+{
     struct pollfd pfds[2];
     pfds[0].fd = STDIN_FILENO;
     pfds[0].events = POLLIN;
@@ -109,72 +194,39 @@ int main(int argc , char *argv[])
         int ret = poll(pfds, 2, -1);
         if (ret < 0) {
             perror("poll");
-            break;
+            return -1;
         }
 
-        // stdin ready
         if (pfds[0].revents & POLLIN) {
-            if (!fgets(line, sizeof(line), stdin)) {
-                fprintf(stderr, "stdin closed\n");
-                break;
-            }
-            size_t len = strlen(line);
-            while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) {
-                line[len-1] = '\0';
-                len--;
-            }
-            if (len == 0) continue;
-
-            if (strcmp(role, "OWNER") == 0) {
-                if (strncmp(line, "1 ", 2) == 0) {
-                    snprintf(buff, sizeof(buff), "SET CODE %s", line + 2);
-                } else if (strncmp(line, "2 ", 2) == 0) {
-                    snprintf(buff, sizeof(buff), "SET VALIDITY %s", line + 2);
-                } else if (strcmp(line, "3") == 0) {
-                    snprintf(buff, sizeof(buff), "SHOW");
-                } else if (strcmp(line, "4") == 0) {
-                    snprintf(buff, sizeof(buff), "QUIT");
-                } else {
-                    printf("Commande inconnue. Utiliser 1/2/3/4.\n");
-                    continue;
-                }
-            } else { // TENANT
-                if (strncmp(line, "1 ", 2) == 0) {
-                    snprintf(buff, sizeof(buff), "%s", line + 2);
-                } else if (strcmp(line, "2") == 0) {
-                    snprintf(buff, sizeof(buff), "QUIT");
-                } else {
-                    printf("Commande inconnue. Utiliser 1/2.\n");
-                    continue;
-                }
-            }
-
-            if (send_all(sock, buff, strlen(buff)) < 0) {
-                perror("send failed");
-                break;
-            }
-
-            if (strcmp(buff, "QUIT") == 0) {
-                printf("Fermeture de la connexion.\n");
-                break;
-            }
+            int res = handle_stdin(cfg, sock);
+            if (res != 0) return res;
         }
 
-        // socket ready
         if (pfds[1].revents & POLLIN) {
-            n = recv(sock, buff, MSG_LEN - 1, 0);
-            if (n < 0) {
-                perror("recv failed");
-                break;
-            } else if (n == 0) {
-                printf("Serveur fermé la connexion.\n");
-                break;
-            }
-            buff[n] = '\0';
-            printf("Réponse du serveur : \"%s\"\n", buff);
+            int res = handle_socket(sock);
+            if (res != 0) return res;
         }
     }
+}
+
+int main(int argc , char *argv[])
+{
+    client_cfg_t cfg;
+    if (parse_args(argc, argv, &cfg) < 0) {
+        return 1;
+    }
+
+    int sock = connect_server(&cfg);
+    if (sock < 0) return 1;
+
+    if (send_hello(sock, &cfg) < 0) {
+        close(sock);
+        return 1;
+    }
+
+    print_menu(cfg.role);
+    int rc = run_client(&cfg, sock);
 
     close(sock);
-    return 0;
+    return (rc < 0) ? 1 : 0;
 }
