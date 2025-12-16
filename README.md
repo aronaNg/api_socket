@@ -7,13 +7,14 @@
 
 ## Description
 
-Application client-serveur en C permettant la gestion d'un système de verrouillage avec codes d'accès. Le système distingue deux types d'utilisateurs :
+Application client-serveur en C permettant la gestion d'un système de verrouillage avec codes d'accès. 
+Le serveur utilise SQLite pour stocker l'historique des tentatives et les comptes utilisateurs avec mots de passe hashés en bcrypt.
+Les jalons 1 2 3 étant déjà montré au prof, ce readme va faire le tour de tout ce qu'on fait jusque là principalement les ajouts apportés dans le jalon 4.
+Le système distingue deux types d'utilisateurs :
 
 - **OWNER** : Propriétaire qui peut définir et gérer les codes d'accès
 - **TENANT** : Locataire qui peut tenter d'entrer des codes pour obtenir l'accès
 
-Le serveur utilise SQLite pour stocker l'historique des tentatives et les comptes utilisateurs avec mots de passe hashés en bcrypt.
-Les jalons 1 2 3 étant déjà montré au prof, ce readme va faire le tour de tout ce qu'on fait jusque là principalement les ajouts apportés dans le jalon 4.
 ---
 
 ## Architecture
@@ -86,7 +87,7 @@ Les jalons 1 2 3 étant déjà montré au prof, ce readme va faire le tour de to
 
 ---
 
-## 📦 Requirements
+## Requirements
 
 ### Système
 
