@@ -1,3 +1,6 @@
+/* server.c - clean implementation with SQLite history
+ * Usage: server <port>
+ */
 
 #include<stdio.h>
 #include<stdlib.h>
@@ -15,36 +18,36 @@
 #define BACKLOG 16
 
 typedef enum {
-	ROLE_UNKNOWN = 0,
-	ROLE_OWNER,
-	ROLE_TENANT
+    ROLE_UNKNOWN = 0,
+    ROLE_OWNER,
+    ROLE_TENANT
 } client_role_t;
 
 typedef struct client_node {
-	int fd;
-	struct sockaddr_in addr;
-	client_role_t role;
-	char pseudo[64];
-	int attempts;
-	struct client_node *next;
+    int fd;
+    struct sockaddr_in addr;
+    client_role_t role;
+    char pseudo[64];
+    int attempts;
+    struct client_node *next;
 } client_node_t;
 
 typedef struct {
-	char code[7]; // 6 digits + '\0'
-	int validity_secs;
-	time_t expires_at;
-	int owner_fd; // -1 if none
-	char owner_pseudo[64];
-	int has_code;
+    char code[7]; // 6 digits + '\0'
+    int validity_secs;
+    time_t expires_at;
+    int owner_fd; // -1 if none
+    char owner_pseudo[64];
+    int has_code;
 } lock_state_t;
 
 static lock_state_t g_lock = {
-	.code = "000000",
-	.validity_secs = 3600,
-	.expires_at = 0,
-	.owner_fd = -1,
-	.owner_pseudo = {0},
-	.has_code = 0
+    .code = "000000",
+    .validity_secs = 3600,
+    .expires_at = 0,
+    .owner_fd = -1,
+    .owner_pseudo = {0},
+    .has_code = 0
 };
 
 static const char *DB_PATH = "history.db";
@@ -122,11 +125,11 @@ static int create_listen_socket(uint16_t port)
 
 static int secure_random_digit(void)
 {
-	unsigned int val = 0;
-	if (getrandom(&val, sizeof(val), 0) != sizeof(val)) {
-		val = (unsigned int)rand();
-	}
-	return (int)(val % 10);
+    unsigned int val = 0;
+    if (getrandom(&val, sizeof(val), 0) != sizeof(val)) {
+        val = (unsigned int)rand();
+    }
+    return (int)(val % 10);
 }
 
 static int db_init(void)
@@ -210,124 +213,95 @@ static void log_history(const char *pseudo, const char *result)
 
 static void notify_owner(const char *msg)
 {
-	if (g_lock.owner_fd >= 0) {
-		ssize_t sent = send(g_lock.owner_fd, msg, strlen(msg), 0);
-		if (sent < 0) {
-			perror("notify_owner send");
-		}
-	}
+    if (g_lock.owner_fd >= 0) {
+        ssize_t sent = send(g_lock.owner_fd, msg, strlen(msg), 0);
+        if (sent < 0) perror("notify_owner send");
+    }
 }
 
 static void rotate_code_and_notify(const char *reason)
 {
-	generate_code(g_lock.code);
-	g_lock.expires_at = time(NULL) + g_lock.validity_secs;
-	char buffer[128];
-	snprintf(buffer, sizeof(buffer), "ALERT %s NEWCODE %s VALIDITY %d\n",
-	         reason ? reason : "update", g_lock.code, g_lock.validity_secs);
-	notify_owner(buffer);
+    generate_code(g_lock.code);
+    g_lock.expires_at = time(NULL) + g_lock.validity_secs;
+    char buffer[128];
+    snprintf(buffer, sizeof(buffer), "ALERT %s NEWCODE %s VALIDITY %d\n",
+             reason ? reason : "update", g_lock.code, g_lock.validity_secs);
+    notify_owner(buffer);
 }
 
 static void add_client(client_node_t **head, int fd, const struct sockaddr_in *addr)
 {
-	client_node_t *node = malloc(sizeof(client_node_t));
-	if (!node)
-	{
-		perror("malloc");
-		close(fd);
-		return;
-	}
-	node->fd = fd;
-	node->addr = *addr;
-	node->role = ROLE_UNKNOWN;
-	node->pseudo[0] = '\0';
-	node->attempts = 0;
-	node->next = *head;
-	*head = node;
+    client_node_t *node = malloc(sizeof(client_node_t));
+    if (!node) { perror("malloc"); close(fd); return; }
+    node->fd = fd;
+    node->addr = *addr;
+    node->role = ROLE_UNKNOWN;
+    node->pseudo[0] = '\0';
+    node->attempts = 0;
+    node->next = *head;
+    *head = node;
 }
 
 static void remove_client(client_node_t **head, client_node_t *target)
 {
-	if (!target)
-	{
-		return;
-	}
-
-	client_node_t **cursor = head;
-	while (*cursor)
-	{
-		if (*cursor == target)
-		{
-			client_node_t *tmp = *cursor;
-			*cursor = tmp->next;
-			if (tmp->fd == g_lock.owner_fd)
-			{
-				g_lock.owner_fd = -1;
-			}
-			close(tmp->fd);
-			free(tmp);
-			return;
-		}
-		cursor = &(*cursor)->next;
-	}
+    if (!target) return;
+    client_node_t **cursor = head;
+    while (*cursor) {
+        if (*cursor == target) {
+            client_node_t *tmp = *cursor;
+            *cursor = tmp->next;
+            if (tmp->fd == g_lock.owner_fd) g_lock.owner_fd = -1;
+            close(tmp->fd);
+            free(tmp);
+            return;
+        }
+        cursor = &(*cursor)->next;
+    }
 }
 
 static size_t client_count(const client_node_t *head)
 {
-	size_t count = 0;
-	while (head)
-	{
-		++count;
-		head = head->next;
-	}
-	return count;
+    size_t count = 0;
+    while (head) { ++count; head = head->next; }
+    return count;
 }
 
 static void log_client_endpoint(const client_node_t *node, const char *prefix)
 {
-	char ip[INET_ADDRSTRLEN] = {0};
-	inet_ntop(AF_INET, &(node->addr.sin_addr), ip, sizeof(ip));
-	printf("%s %s:%u\n", prefix, ip, ntohs(node->addr.sin_port));
-	fflush(stdout);
+    char ip[INET_ADDRSTRLEN] = {0};
+    inet_ntop(AF_INET, &(node->addr.sin_addr), ip, sizeof(ip));
+    printf("%s %s:%u\n", prefix, ip, ntohs(node->addr.sin_port));
+    fflush(stdout);
 }
 
 static void trim_newline(char *s)
 {
-	if (!s) return;
-	size_t len = strlen(s);
-	while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r'))
-	{
-		s[len - 1] = '\0';
-		--len;
-	}
+    if (!s) return;
+    size_t len = strlen(s);
+    while (len > 0 && (s[len-1] == '\n' || s[len-1] == '\r')) { s[len-1] = '\0'; --len; }
 }
 
 static int is_six_digits(const char *s)
 {
-	if (!s) return 0;
-	if (strlen(s) != 6) return 0;
-	for (size_t i = 0; i < 6; ++i) {
-		if (s[i] < '0' || s[i] > '9') return 0;
-	}
-	return 1;
+    if (!s) return 0;
+    if (strlen(s) != 6) return 0;
+    for (size_t i = 0; i < 6; ++i) if (s[i] < '0' || s[i] > '9') return 0;
+    return 1;
 }
 
 static int remaining_validity_seconds(void)
 {
-	time_t now = time(NULL);
-	if (g_lock.expires_at <= now) return 0;
-	return (int)(g_lock.expires_at - now);
+    time_t now = time(NULL);
+    if (g_lock.expires_at <= now) return 0;
+    return (int)(g_lock.expires_at - now);
 }
 
 static int pseudo_allowed(client_role_t role, const char *pseudo)
 {
-	const char *const *list = (role == ROLE_OWNER) ? ALLOWED_OWNERS : ALLOWED_TENANTS;
-	if (!pseudo || !list) return 0;
-	for (size_t i = 0; list[i]; ++i)
-	{
-		if (strcmp(list[i], pseudo) == 0) return 1;
-	}
-	return 0;
+    const char *const *list = (role == ROLE_OWNER) ? ALLOWED_OWNERS : ALLOWED_TENANTS;
+    if (!pseudo || !list) return 0;
+    for (size_t i = 0; list[i]; ++i) if (strcmp(list[i], pseudo) == 0) return 1;
+    return 0;
 }
 
 static void ensure_code_fresh(void)
