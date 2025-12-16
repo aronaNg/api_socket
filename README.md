@@ -1,4 +1,6 @@
-# api_socket jalon 4
+# Projet RC52 API Socket by Corentin DEFIOLLES & Arona NGOM
+
+## api_socket jalon 4
 
 Refactor
 -------
@@ -7,12 +9,20 @@ Refactor
 
 - In `server.c`, port parsing, socket setup, client acceptance, role identification, owner/tenant command handling, and polling are split into focused helpers (`parse_port_arg`, `create_listen_socket`, `handle_client_message`, `poll_loop`, etc.), leaving `main` to initialize and launch the loop.
 
+Dans le Jalon 4 nous avons créer une base de données SQL Lite qui stockait dans un premier temps l'historique du serveur
+et maintenant des Users et leurs mot de passe (en clair) qui sécurise un minimum l'accès à l'application
 
 Compilation
 -----------
 
 - `gcc server.c -o server -lsqlite3`
 - `gcc client.c -o client`
+
+Exemple d'exécution dans des terminaux séparés :
+-----------
+- `./server 8000`
+- `./client 127.0.0.1 8000 OWNER Arona aronapass`
+- `./client 127.0.0.1 8000 TENANT Corentin corentinpass`
 
 # System requirements et commandes d'installation
 
