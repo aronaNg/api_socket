@@ -53,8 +53,19 @@ static lock_state_t g_lock = {
 static const char *DB_PATH = "history.db";
 static sqlite3 *g_db = NULL;
 
-static const char *ALLOWED_OWNERS[] = {"owner", "Arona", NULL};
-static const char *ALLOWED_TENANTS[] = {"tenant", "Corentin", NULL};
+typedef struct {
+	const char *pseudo;
+	const char *role;     // "OWNER" ou "TENANT"
+	const char *password; // mot de passe en clair pour la démo
+} default_user_t;
+
+static const default_user_t DEFAULT_USERS[] = {
+	{"owner",    "OWNER",   "ownerpass"},
+	{"Arona",    "OWNER",   "aronapass"},
+	{"tenant",   "TENANT",  "tenantpass"},
+	{"Corentin", "TENANT",  "corentinpass"},
+	{NULL, NULL, NULL}
+};
 
 /* ------------------------- utilitaires sockets ------------------------- */
 static int parse_port_arg(int argc, char **argv, uint16_t *out_port)
@@ -140,7 +151,7 @@ static int db_init(void)
 		return -1;
 	}
 
-	const char *sql =
+	const char *sql_history =
 		"CREATE TABLE IF NOT EXISTS history ("
 		"id INTEGER PRIMARY KEY AUTOINCREMENT,"
 		"ts INTEGER NOT NULL,"
@@ -148,14 +159,61 @@ static int db_init(void)
 		"result TEXT NOT NULL"
 		");";
 
+	const char *sql_users =
+		"CREATE TABLE IF NOT EXISTS users ("
+		"pseudo TEXT PRIMARY KEY,"
+		"role TEXT NOT NULL CHECK(role IN ('OWNER','TENANT')),"
+		"password TEXT NOT NULL"
+		");";
+
 	char *errmsg = NULL;
-	int rc = sqlite3_exec(g_db, sql, NULL, NULL, &errmsg);
+	int rc = sqlite3_exec(g_db, sql_history, NULL, NULL, &errmsg);
 	if (rc != SQLITE_OK)
 	{
-		fprintf(stderr, "sqlite3_exec(create table) failed: %s\n", errmsg ? errmsg : "unknown");
+		fprintf(stderr, "sqlite3_exec(create history) failed: %s\n", errmsg ? errmsg : "unknown");
 		sqlite3_free(errmsg);
 		return -1;
 	}
+	sqlite3_free(errmsg);
+	errmsg = NULL;
+
+	rc = sqlite3_exec(g_db, sql_users, NULL, NULL, &errmsg);
+	if (rc != SQLITE_OK)
+	{
+		fprintf(stderr, "sqlite3_exec(create users) failed: %s\n", errmsg ? errmsg : "unknown");
+		sqlite3_free(errmsg);
+		return -1;
+	}
+	sqlite3_free(errmsg);
+
+	// Upsert: on écrase les mots de passe existants pour garder les valeurs par défaut connues.
+	const char *sql_insert =
+		"INSERT INTO users(pseudo, role, password) VALUES(?, ?, ?)"
+		" ON CONFLICT(pseudo) DO UPDATE SET role=excluded.role, password=excluded.password;";
+
+	sqlite3_stmt *stmt = NULL;
+	if (sqlite3_prepare_v2(g_db, sql_insert, -1, &stmt, NULL) != SQLITE_OK)
+	{
+		fprintf(stderr, "sqlite3_prepare_v2(insert users) failed: %s\n", sqlite3_errmsg(g_db));
+		return -1;
+	}
+
+	for (const default_user_t *u = DEFAULT_USERS; u->pseudo; ++u)
+	{
+		sqlite3_reset(stmt);
+		sqlite3_clear_bindings(stmt);
+		sqlite3_bind_text(stmt, 1, u->pseudo, -1, SQLITE_STATIC);
+		sqlite3_bind_text(stmt, 2, u->role, -1, SQLITE_STATIC);
+		sqlite3_bind_text(stmt, 3, u->password, -1, SQLITE_STATIC);
+		rc = sqlite3_step(stmt);
+		if (rc != SQLITE_DONE && rc != SQLITE_CONSTRAINT)
+		{
+			fprintf(stderr, "sqlite3_step(insert user) failed: %s\n", sqlite3_errmsg(g_db));
+			sqlite3_finalize(stmt);
+			return -1;
+		}
+	}
+	sqlite3_finalize(stmt);
 	return 0;
 }
 
@@ -296,14 +354,6 @@ static int remaining_validity_seconds(void)
     return (int)(g_lock.expires_at - now);
 }
 
-static int pseudo_allowed(client_role_t role, const char *pseudo)
-{
-    const char *const *list = (role == ROLE_OWNER) ? ALLOWED_OWNERS : ALLOWED_TENANTS;
-    if (!pseudo || !list) return 0;
-    for (size_t i = 0; list[i]; ++i) if (strcmp(list[i], pseudo) == 0) return 1;
-    return 0;
-}
-
 static void ensure_code_fresh(void)
 {
 	if (!g_lock.has_code)
@@ -335,6 +385,8 @@ static void accept_new_client(int listen_fd, client_node_t **clients)
 	add_client(clients, client_sock, &client_addr);
 	client_node_t temp = {.fd = client_sock, .addr = client_addr, .next = NULL};
 	log_client_endpoint(&temp, "New client");
+	const char *hello = "LOGIN using: AUTH OWNER|TENANT <pseudo> <password>\n";
+	send(client_sock, hello, strlen(hello), 0);
 }
 
 static void send_owner_welcome(client_node_t *node)
@@ -363,41 +415,81 @@ static void send_tenant_welcome(client_node_t *node)
 	send(node->fd, msg, strlen(msg), 0);
 }
 
+static client_role_t role_from_string(const char *role_str)
+{
+	if (!role_str) return ROLE_UNKNOWN;
+	if (strcmp(role_str, "OWNER") == 0) return ROLE_OWNER;
+	if (strcmp(role_str, "TENANT") == 0) return ROLE_TENANT;
+	return ROLE_UNKNOWN;
+}
+
+static int db_authenticate(const char *role_str, const char *pseudo, const char *password, client_role_t *out_role)
+{
+	if (!g_db || !role_str || !pseudo || !password) return -1;
+
+	const char *sql =
+		"SELECT role FROM users WHERE pseudo = ? AND password = ? AND role = ?;";
+	sqlite3_stmt *stmt = NULL;
+	if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK)
+	{
+		fprintf(stderr, "sqlite3_prepare_v2(auth) failed: %s\n", sqlite3_errmsg(g_db));
+		return -1;
+	}
+
+	sqlite3_bind_text(stmt, 1, pseudo, -1, SQLITE_TRANSIENT);
+	sqlite3_bind_text(stmt, 2, password, -1, SQLITE_TRANSIENT);
+	sqlite3_bind_text(stmt, 3, role_str, -1, SQLITE_TRANSIENT);
+
+	int rc = sqlite3_step(stmt);
+	if (rc == SQLITE_ROW)
+	{
+		if (out_role) *out_role = role_from_string(role_str);
+		sqlite3_finalize(stmt);
+		return 0;
+	}
+
+	sqlite3_finalize(stmt);
+	return -1;
+}
+
 static int handle_initial_ident(client_node_t **clients, client_node_t *node, const char *msg)
 {
-	if (strncmp(msg, "OWNER ", 6) == 0)
+	char role[16] = {0};
+	char pseudo[64] = {0};
+	char password[64] = {0};
+
+	if (sscanf(msg, "AUTH %15s %63s %63s", role, pseudo, password) == 3)
 	{
-		node->role = ROLE_OWNER;
-		strncpy(node->pseudo, msg + 6, sizeof(node->pseudo) - 1);
-		node->pseudo[sizeof(node->pseudo) - 1] = '\0';
-		if (!pseudo_allowed(node->role, node->pseudo))
+		client_role_t r = ROLE_UNKNOWN;
+		if (db_authenticate(role, pseudo, password, &r) == 0 && r != ROLE_UNKNOWN)
 		{
-			const char *err = "ERR unauthorized pseudo\n";
-			send(node->fd, err, strlen(err), 0);
-			remove_client(clients, node);
-			return 1;
+			node->role = r;
+			strncpy(node->pseudo, pseudo, sizeof(node->pseudo) - 1);
+			node->pseudo[sizeof(node->pseudo) - 1] = '\0';
+
+			if (node->role == ROLE_OWNER)
+			{
+				send_owner_welcome(node);
+			}
+			else
+			{
+				send_tenant_welcome(node);
+			}
+			return 0;
 		}
-		send_owner_welcome(node);
-		return 0;
+
+		char ip[INET_ADDRSTRLEN] = {0};
+		inet_ntop(AF_INET, &(node->addr.sin_addr), ip, sizeof(ip));
+		printf("Auth failed role=%s pseudo=%s from %s:%u\n",
+		       role, pseudo, ip, ntohs(node->addr.sin_port));
+		fflush(stdout);
+		const char *err = "ERR authentication failed\n";
+		send(node->fd, err, strlen(err), 0);
+		remove_client(clients, node);
+		return 1;
 	}
 
-	if (strncmp(msg, "TENANT ", 7) == 0)
-	{
-		node->role = ROLE_TENANT;
-		strncpy(node->pseudo, msg + 7, sizeof(node->pseudo) - 1);
-		node->pseudo[sizeof(node->pseudo) - 1] = '\0';
-		if (!pseudo_allowed(node->role, node->pseudo))
-		{
-			const char *err = "ERR unauthorized pseudo\n";
-			send(node->fd, err, strlen(err), 0);
-			remove_client(clients, node);
-			return 1;
-		}
-		send_tenant_welcome(node);
-		return 0;
-	}
-
-	const char *err = "ERR specify OWNER <pseudo> or TENANT <pseudo>\n";
+	const char *err = "ERR use: AUTH OWNER|TENANT <pseudo> <password>\n";
 	send(node->fd, err, strlen(err), 0);
 	return 0;
 }

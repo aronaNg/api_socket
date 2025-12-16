@@ -36,6 +36,14 @@ gcc server.c -o server -lsqlite3
 gcc client.c -o client
 ```
 
+Authentification
+----------------
+- Les comptes sont stockés dans `history.db` (table `users`) et pré-remplis :
+  - OWNER: `owner / ownerpass`, `Arona / aronapass`
+  - TENANT: `tenant / tenantpass`, `Corentin / corentinpass`
+- Connexion client : `./client <ip> <port> <ROLE> <pseudo> <password>`
+  - Exemple: `./client 127.0.0.1 8080 OWNER owner ownerpass`
+
 Accéder à la base de données:
 Commandes:
 ```bash

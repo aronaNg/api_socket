@@ -13,6 +13,7 @@ typedef struct {
     int port;
     const char *role;
     const char *pseudo;
+    const char *password;
 } client_cfg_t;
 
 static ssize_t send_all(int fd, const void *buf, size_t len)
@@ -29,8 +30,8 @@ static ssize_t send_all(int fd, const void *buf, size_t len)
 
 static int parse_args(int argc, char **argv, client_cfg_t *out)
 {
-    if (argc != 5) {
-        fprintf(stderr, "Usage: %s <server_ip> <server_port> <ROLE> <pseudo>\n", argv[0]);
+    if (argc != 6) {
+        fprintf(stderr, "Usage: %s <server_ip> <server_port> <ROLE> <pseudo> <password>\n", argv[0]);
         fprintf(stderr, "ROLE = OWNER | TENANT\n");
         return -1;
     }
@@ -50,6 +51,7 @@ static int parse_args(int argc, char **argv, client_cfg_t *out)
     out->port = port;
     out->role = argv[3];
     out->pseudo = argv[4];
+    out->password = argv[5];
     return 0;
 }
 
@@ -60,7 +62,6 @@ static int connect_server(const client_cfg_t *cfg)
         perror("Peut pas créer de socket");
         return -1;
     }
-    puts("Socket créée");
 
     struct sockaddr_in adresse;
     memset(&adresse, 0, sizeof(adresse));
@@ -78,14 +79,13 @@ static int connect_server(const client_cfg_t *cfg)
         close(sock);
         return -1;
     }
-    puts("Connecté\n");
     return sock;
 }
 
 static int send_hello(int sock, const client_cfg_t *cfg)
 {
     char hello[MSG_LEN];
-    snprintf(hello, sizeof(hello), "%s %s", cfg->role, cfg->pseudo);
+    snprintf(hello, sizeof(hello), "AUTH %s %s %s", cfg->role, cfg->pseudo, cfg->password);
     if (send_all(sock, hello, strlen(hello)) < 0) {
         perror("send hello failed");
         return -1;
@@ -166,7 +166,7 @@ static int handle_stdin(const client_cfg_t *cfg, int sock)
     return 0;
 }
 
-static int handle_socket(int sock)
+static int handle_socket(int sock, char *last_msg, size_t last_msg_sz)
 {
     char buff[MSG_LEN];
     ssize_t n = recv(sock, buff, MSG_LEN - 1, 0);
@@ -178,6 +178,10 @@ static int handle_socket(int sock)
         return 1; // stop
     }
     buff[n] = '\0';
+    if (last_msg && last_msg_sz > 0) {
+        strncpy(last_msg, buff, last_msg_sz - 1);
+        last_msg[last_msg_sz - 1] = '\0';
+    }
     printf("Réponse du serveur : \"%s\"\n", buff);
     return 0;
 }
@@ -203,7 +207,8 @@ static int run_client(const client_cfg_t *cfg, int sock)
         }
 
         if (pfds[1].revents & POLLIN) {
-            int res = handle_socket(sock);
+            char last[MSG_LEN] = {0};
+            int res = handle_socket(sock, last, sizeof(last));
             if (res != 0) return res;
         }
     }
@@ -224,7 +229,32 @@ int main(int argc , char *argv[])
         return 1;
     }
 
+    // Attente d'une réponse d'authentification avant d'afficher le menu
+    // On boucle tant qu'on ne reçoit pas un succès ou un échec explicite.
+    while (1) {
+        char msg[MSG_LEN] = {0};
+        int rc = handle_socket(sock, msg, sizeof(msg));
+        if (rc != 0) { // erreur ou fermeture
+            close(sock);
+            return 1;
+        }
+
+        if (strncmp(msg, "ERR", 3) == 0) {
+            printf("Identifiants incorrects, arrêt.\n");
+            close(sock);
+            return 1;
+        }
+
+        if (strncmp(msg, "WELCOME", 7) == 0 || strncmp(msg, "CURRENT CODE", 12) == 0) {
+            break; // authentification acceptée
+        }
+
+        // Si on reçoit une invite "LOGIN ..." on continue la boucle pour attendre l'issue.
+    }
+
+    puts("Connecté (auth OK)\n");
     print_menu(cfg.role);
+
     int rc = run_client(&cfg, sock);
 
     close(sock);
