@@ -2,6 +2,7 @@
  * Usage: server <port>
  */
 
+#define _GNU_SOURCE
 #include<stdio.h>
 #include<stdlib.h>
 #include<string.h>
@@ -13,6 +14,7 @@
 #include<sys/random.h>
 #include<time.h>
 #include<sqlite3.h>
+#include<crypt.h>
 
 #define MSG_LEN 1024
 #define BACKLOG 16
@@ -68,6 +70,18 @@ static const default_user_t DEFAULT_USERS[] = {
 };
 
 /* ------------------------- utilitaires sockets ------------------------- */
+static ssize_t send_all(int fd, const void *buf, size_t len)
+{
+	size_t sent = 0;
+	const char *p = buf;
+	while (sent < len) {
+		ssize_t n = send(fd, p + sent, len - sent, 0);
+		if (n < 0) return -1;
+		sent += (size_t)n;
+	}
+	return (ssize_t)sent;
+}
+
 static int parse_port_arg(int argc, char **argv, uint16_t *out_port)
 {
 	long port;
@@ -143,6 +157,57 @@ static int secure_random_digit(void)
     return (int)(val % 10);
 }
 
+static char *hash_password(const char *password)
+{
+	if (!password) return NULL;
+	
+	// Générer un salt bcrypt avec crypt_gensalt() (plus sûr)
+	const char *salt_ptr = crypt_gensalt("$2b$", 10, NULL, 0);
+	if (!salt_ptr) {
+		fprintf(stderr, "crypt_gensalt failed\n");
+		return NULL;
+	}
+	
+	// Copier le salt dans un buffer local (crypt_gensalt retourne un pointeur statique)
+	char salt[30];
+	strncpy(salt, salt_ptr, sizeof(salt) - 1);
+	salt[sizeof(salt) - 1] = '\0';
+	
+	// Hasher le mot de passe avec crypt()
+	struct crypt_data cdata;
+	cdata.initialized = 0;
+	char *hash = crypt_r(password, salt, &cdata);
+	
+	if (!hash) {
+		fprintf(stderr, "crypt_r failed\n");
+		return NULL;
+	}
+	
+	// Allouer et copier le hash (60 caractères pour bcrypt)
+	char *result = malloc(61);
+	if (!result) {
+		perror("malloc hash_password");
+		return NULL;
+	}
+	strncpy(result, hash, 60);
+	result[60] = '\0';
+	return result;
+}
+
+static int verify_password(const char *password, const char *stored_hash)
+{
+	if (!password || !stored_hash) return 0;
+	
+	struct crypt_data cdata;
+	cdata.initialized = 0;
+	char *computed = crypt_r(password, stored_hash, &cdata);
+	
+	if (!computed) return 0;
+	
+	// Comparer les hash de manière sécurisée (timing-safe)
+	return (strcmp(computed, stored_hash) == 0);
+}
+
 static int db_init(void)
 {
 	if (sqlite3_open(DB_PATH, &g_db) != SQLITE_OK)
@@ -200,12 +265,23 @@ static int db_init(void)
 
 	for (const default_user_t *u = DEFAULT_USERS; u->pseudo; ++u)
 	{
+		// Hasher le mot de passe avec bcrypt
+		char *hashed_password = hash_password(u->password);
+		if (!hashed_password)
+		{
+			fprintf(stderr, "hash_password failed for user %s\n", u->pseudo);
+			sqlite3_finalize(stmt);
+			return -1;
+		}
+		
 		sqlite3_reset(stmt);
 		sqlite3_clear_bindings(stmt);
 		sqlite3_bind_text(stmt, 1, u->pseudo, -1, SQLITE_STATIC);
 		sqlite3_bind_text(stmt, 2, u->role, -1, SQLITE_STATIC);
-		sqlite3_bind_text(stmt, 3, u->password, -1, SQLITE_STATIC);
+		sqlite3_bind_text(stmt, 3, hashed_password, -1, SQLITE_TRANSIENT);
 		rc = sqlite3_step(stmt);
+		free(hashed_password);
+		
 		if (rc != SQLITE_DONE && rc != SQLITE_CONSTRAINT)
 		{
 			fprintf(stderr, "sqlite3_step(insert user) failed: %s\n", sqlite3_errmsg(g_db));
@@ -272,8 +348,9 @@ static void log_history(const char *pseudo, const char *result)
 static void notify_owner(const char *msg)
 {
     if (g_lock.owner_fd >= 0) {
-        ssize_t sent = send(g_lock.owner_fd, msg, strlen(msg), 0);
-        if (sent < 0) perror("notify_owner send");
+        if (send_all(g_lock.owner_fd, msg, strlen(msg)) < 0) {
+            perror("notify_owner send");
+        }
     }
 }
 
@@ -386,7 +463,7 @@ static void accept_new_client(int listen_fd, client_node_t **clients)
 	client_node_t temp = {.fd = client_sock, .addr = client_addr, .next = NULL};
 	log_client_endpoint(&temp, "New client");
 	const char *hello = "LOGIN using: AUTH OWNER|TENANT <pseudo> <password>\n";
-	send(client_sock, hello, strlen(hello), 0);
+	send_all(client_sock, hello, strlen(hello));
 }
 
 static void send_owner_welcome(client_node_t *node)
@@ -402,7 +479,7 @@ static void send_owner_welcome(client_node_t *node)
 	char welcome[128];
 	snprintf(welcome, sizeof(welcome), "WELCOME %s CODE %s VALIDITY %d\n",
 	         node->pseudo, g_lock.code, remaining_validity_seconds());
-	send(node->fd, welcome, strlen(welcome), 0);
+	send_all(node->fd, welcome, strlen(welcome));
 }
 
 static void send_tenant_welcome(client_node_t *node)
@@ -412,7 +489,7 @@ static void send_tenant_welcome(client_node_t *node)
 	char msg[160];
 	snprintf(msg, sizeof(msg), "CURRENT CODE %s VALIDITY %d\nENTER CODE\n",
 	         g_lock.code, remaining_validity_seconds());
-	send(node->fd, msg, strlen(msg), 0);
+	send_all(node->fd, msg, strlen(msg));
 }
 
 static client_role_t role_from_string(const char *role_str)
@@ -427,8 +504,9 @@ static int db_authenticate(const char *role_str, const char *pseudo, const char 
 {
 	if (!g_db || !role_str || !pseudo || !password) return -1;
 
+	// Récupérer le hash stocké dans la base de données
 	const char *sql =
-		"SELECT role FROM users WHERE pseudo = ? AND password = ? AND role = ?;";
+		"SELECT password, role FROM users WHERE pseudo = ? AND role = ?;";
 	sqlite3_stmt *stmt = NULL;
 	if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK)
 	{
@@ -437,15 +515,20 @@ static int db_authenticate(const char *role_str, const char *pseudo, const char 
 	}
 
 	sqlite3_bind_text(stmt, 1, pseudo, -1, SQLITE_TRANSIENT);
-	sqlite3_bind_text(stmt, 2, password, -1, SQLITE_TRANSIENT);
-	sqlite3_bind_text(stmt, 3, role_str, -1, SQLITE_TRANSIENT);
+	sqlite3_bind_text(stmt, 2, role_str, -1, SQLITE_TRANSIENT);
 
 	int rc = sqlite3_step(stmt);
 	if (rc == SQLITE_ROW)
 	{
-		if (out_role) *out_role = role_from_string(role_str);
-		sqlite3_finalize(stmt);
-		return 0;
+		const unsigned char *stored_hash = sqlite3_column_text(stmt, 0);
+		const unsigned char *stored_role = sqlite3_column_text(stmt, 1);
+		
+		if (stored_hash && verify_password(password, (const char *)stored_hash))
+		{
+			if (out_role) *out_role = role_from_string((const char *)stored_role);
+			sqlite3_finalize(stmt);
+			return 0;
+		}
 	}
 
 	sqlite3_finalize(stmt);
@@ -484,13 +567,13 @@ static int handle_initial_ident(client_node_t **clients, client_node_t *node, co
 		       role, pseudo, ip, ntohs(node->addr.sin_port));
 		fflush(stdout);
 		const char *err = "ERR authentication failed\n";
-		send(node->fd, err, strlen(err), 0);
+		send_all(node->fd, err, strlen(err));
 		remove_client(clients, node);
 		return 1;
 	}
 
 	const char *err = "ERR use: AUTH OWNER|TENANT <pseudo> <password>\n";
-	send(node->fd, err, strlen(err), 0);
+	send_all(node->fd, err, strlen(err));
 	return 0;
 }
 
@@ -502,7 +585,7 @@ static int handle_owner_command(client_node_t **clients, client_node_t *node, co
 		if (!is_six_digits(newcode))
 		{
 			const char *err = "ERR code must be 6 digits\n";
-			send(node->fd, err, strlen(err), 0);
+			send_all(node->fd, err, strlen(err));
 			return 0;
 		}
 		strncpy(g_lock.code, newcode, sizeof(g_lock.code));
@@ -511,7 +594,7 @@ static int handle_owner_command(client_node_t **clients, client_node_t *node, co
 		char resp[128];
 		snprintf(resp, sizeof(resp), "OK CODE %s VALIDITY %d\n",
 		         g_lock.code, g_lock.validity_secs);
-		send(node->fd, resp, strlen(resp), 0);
+		send_all(node->fd, resp, strlen(resp));
 		return 0;
 	}
 
@@ -522,7 +605,7 @@ static int handle_owner_command(client_node_t **clients, client_node_t *node, co
 		if (seconds <= 0)
 		{
 			const char *err = "ERR validity must be > 0\n";
-			send(node->fd, err, strlen(err), 0);
+			send_all(node->fd, err, strlen(err));
 			return 0;
 		}
 		g_lock.validity_secs = seconds;
@@ -530,7 +613,7 @@ static int handle_owner_command(client_node_t **clients, client_node_t *node, co
 		char resp[128];
 		snprintf(resp, sizeof(resp), "OK CODE %s VALIDITY %d\n",
 		         g_lock.code, g_lock.validity_secs);
-		send(node->fd, resp, strlen(resp), 0);
+		send_all(node->fd, resp, strlen(resp));
 		return 0;
 	}
 
@@ -539,20 +622,20 @@ static int handle_owner_command(client_node_t **clients, client_node_t *node, co
 		char resp[128];
 		snprintf(resp, sizeof(resp), "OK CODE %s VALIDITY %d\n",
 		         g_lock.code, remaining_validity_seconds());
-		send(node->fd, resp, strlen(resp), 0);
+		send_all(node->fd, resp, strlen(resp));
 		return 0;
 	}
 
 	if (strcmp(msg, "QUIT") == 0)
 	{
 		const char *bye = "BYE\n";
-		send(node->fd, bye, strlen(bye), 0);
+		send_all(node->fd, bye, strlen(bye));
 		remove_client(clients, node);
 		return 1;
 	}
 
 	const char *err = "ERR unknown command\n";
-	send(node->fd, err, strlen(err), 0);
+	send_all(node->fd, err, strlen(err));
 	return 0;
 }
 
@@ -561,7 +644,7 @@ static int handle_tenant_command(client_node_t *node, const char *msg)
 	if (!g_lock.has_code)
 	{
 		const char *err = "ERR no code available\n";
-		send(node->fd, err, strlen(err), 0);
+		send_all(node->fd, err, strlen(err));
 		return 0;
 	}
 
@@ -570,7 +653,7 @@ static int handle_tenant_command(client_node_t *node, const char *msg)
 	{
 		rotate_code_and_notify("code expired");
 		const char *expired = "ERR CODE EXPIRED\n";
-		send(node->fd, expired, strlen(expired), 0);
+		send_all(node->fd, expired, strlen(expired));
 		log_history(node->pseudo, "code expired");
 		return 0;
 	}
@@ -578,14 +661,14 @@ static int handle_tenant_command(client_node_t *node, const char *msg)
 	if (!is_six_digits(msg))
 	{
 		const char *err = "ERR code must be 6 digits\n";
-		send(node->fd, err, strlen(err), 0);
+		send_all(node->fd, err, strlen(err));
 		return 0;
 	}
 
 	if (strcmp(msg, g_lock.code) == 0)
 	{
 		const char *ok = "ACCESS GRANTED\n";
-		send(node->fd, ok, strlen(ok), 0);
+		send_all(node->fd, ok, strlen(ok));
 		log_history(node->pseudo, "success");
 		node->attempts = 0;
 		return 0;
@@ -597,14 +680,14 @@ static int handle_tenant_command(client_node_t *node, const char *msg)
 		log_history(node->pseudo, "alarm triggered");
 		rotate_code_and_notify("alarm");
 		const char *alarm = "ALARM TRIGGERED\n";
-		send(node->fd, alarm, strlen(alarm), 0);
+		send_all(node->fd, alarm, strlen(alarm));
 		node->attempts = 0;
 		return 0;
 	}
 
 	char err[64];
 	snprintf(err, sizeof(err), "INVALID CODE (%d/3)\n", node->attempts);
-	send(node->fd, err, strlen(err), 0);
+	send_all(node->fd, err, strlen(err));
 	log_history(node->pseudo, "failed attempt");
 	return 0;
 }
@@ -655,6 +738,15 @@ static void handle_client_event(client_node_t **clients, client_node_t *node, sh
 		if (bytes > 0)
 		{
 			client_message[bytes] = '\0';
+			// Vérifier si le message est complet (se termine par \n ou \r\n)
+			// Si on a reçu MSG_LEN-1 bytes, le message pourrait être tronqué
+			if (bytes == MSG_LEN - 1 && client_message[bytes - 1] != '\n' && client_message[bytes - 1] != '\r')
+			{
+				fprintf(stderr, "Warning: message might be truncated from client fd=%d\n", node->fd);
+				// Nettoyer le buffer et ignorer ce message incomplet
+				remove_client(clients, node);
+				return;
+			}
 			trim_newline(client_message);
 			process_client_data(clients, node, client_message);
 			return;

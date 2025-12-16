@@ -10,12 +10,12 @@ Refactor
 - In `server.c`, port parsing, socket setup, client acceptance, role identification, owner/tenant command handling, and polling are split into focused helpers (`parse_port_arg`, `create_listen_socket`, `handle_client_message`, `poll_loop`, etc.), leaving `main` to initialize and launch the loop.
 
 Dans le Jalon 4 nous avons créer une base de données SQL Lite qui stockait dans un premier temps l'historique du serveur
-et maintenant des Users et leurs mot de passe (en clair) qui sécurise un minimum l'accès à l'application
+et maintenant des Users et leurs mot de passe (hashés avec bcrypt) qui sécurise l'accès à l'application
 
 Compilation
 -----------
 
-- `gcc server.c -o server -lsqlite3`
+- `gcc server.c -o server -lsqlite3 -lcrypt`
 - `gcc client.c -o client`
 
 Exemple d'exécution dans des terminaux séparés :
@@ -42,7 +42,7 @@ sudo apt install -y build-essential libsqlite3-dev pkg-config
 
 Compiler:
 ```bash
-gcc server.c -o server -lsqlite3
+gcc server.c -o server -lsqlite3 -lcrypt
 gcc client.c -o client
 ```
 
@@ -63,22 +63,5 @@ sqlite3 history.db
 SELECT id, datetime(ts,'unixepoch','localtime') AS ts, pseudo, result FROM history ORDER BY ts DESC LIMIT 200;
 ```
 
-## MSYS2 / MinGW (recommandé sur Windows pour gcc)
-Installer MSYS2 depuis https://www.msys2.org puis ouvrir `MINGW64` shell.
-Paquets requis:
-- mingw-w64-x86_64-gcc
-- mingw-w64-x86_64-make (optionnel)
-- mingw-w64-x86_64-sqlite3
 
-Commandes MSYS2 (MINGW64):
-```bash
-pacman -Syu
-pacman -S --noconfirm mingw-w64-x86_64-gcc mingw-w64-x86_64-sqlite3
-```
-
-Compiler (dans MINGW64 shell):
-```bash
-gcc -o server.exe server.c -lsqlite3
-gcc -o client.exe client.c
-```
 

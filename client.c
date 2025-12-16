@@ -178,6 +178,12 @@ static int handle_socket(int sock, char *last_msg, size_t last_msg_sz)
         return 1; // stop
     }
     buff[n] = '\0';
+    // Vérifier si le message est complet (se termine par \n ou \r\n)
+    // Si on a reçu MSG_LEN-1 bytes, le message pourrait être tronqué
+    if (n == MSG_LEN - 1 && buff[n - 1] != '\n' && buff[n - 1] != '\r') {
+        fprintf(stderr, "Warning: message might be truncated from server\n");
+        return -1;
+    }
     if (last_msg && last_msg_sz > 0) {
         strncpy(last_msg, buff, last_msg_sz - 1);
         last_msg[last_msg_sz - 1] = '\0';
